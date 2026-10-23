@@ -1,0 +1,285 @@
+DRIFT CARTS - PROGRESS LOG
+===========================
+A 3D drifting game built in Rust with Bevy + avian3d physics, using
+Kenney's free CC0 Car Kit assets.
+
+This file is a chronological log of the work done on this project so far.
+
+
+1. PROJECT SETUP
+-----------------
+- Chose Kenney.nl as the asset source (CC0 license, no attribution required)
+  and Bevy as the engine, since the user wanted to build on Rust.
+- Installed Rust via rustup (through Homebrew, since rustup is keg-only on
+  macOS) and set up the PATH in ~/.zshrc.
+- Downloaded Kenney's "Car Kit" asset pack and copied the race.glb/sedan.glb
+  models plus their shared colormap.png texture into assets/models/.
+- Ran `cargo init` to scaffold the project, added `bevy = "0.19"` as a
+  dependency, and set up a `dev` cargo feature (dynamic_linking) for fast
+  incremental rebuilds while iterating, with optimized dependency builds
+  even in dev mode (opt-level=3 for "*", opt-level=1 for our own crate).
+- Wrote an initial src/main.rs: ground plane, directional light, chase
+  camera, and the race-kart model loaded via Bevy's glTF loader.
+- Note: Bevy 0.19 renamed several APIs from older tutorials/docs --
+  `SceneRoot` became `WorldAssetRoot` (now lives in a separate
+  bevy_world_serialization crate), and `shadows_enabled` became
+  `shadow_maps_enabled` on DirectionalLight.
+
+
+2. PHYSICS + DRIVING CONTROLS
+------------------------------
+- Added avian3d 0.7.0 (the Bevy-0.19-compatible version) as the physics
+  engine.
+- Built an arcade-style car controller (not a realistic physics sim):
+  - WASD / arrow keys for throttle and steering.
+  - A `Car` component holds tunable constants: engine_power, max_speed,
+    turn_speed, grip, drift_grip.
+  - Steering yaw-rate scales with current speed (no spinning in place when
+    stopped) and the car's velocity is decomposed into forward/lateral
+    components each frame; "grip" controls how fast the lateral component
+    decays back to zero (high grip = normal driving, low grip = sliding).
+  - A dedicated drift button (Space) drops grip into "drift_grip" mode,
+    letting the back end slide through turns, and also multiplies the
+    turn rate (drift_turn_multiplier) so the car rotates harder into
+    a slide instead of just carrying sideways momentum in a straight line.
+- The car's physics body is an invisible box (RigidBody::Dynamic +
+  Collider::cuboid); the Kenney glTF model is a purely visual child entity
+  that follows along, offset slightly to sit on top of the physics box.
+- At the user's request, both throttle and steering were inverted from
+  the "natural" mapping (W/Up reverses, S/Down accelerates; A/D swapped).
+- Controls were later fixed with a "do not let me spin out of control"
+  style request resulting in a MaxAngularSpeed safety cap (see section 6).
+
+
+3. DRIFT VISUAL EFFECTS
+-------------------------
+- Added a lightweight custom particle system (no external particle crate):
+  a `Particle` component with velocity/age/lifetime/start_scale/end_scale/
+  gravity, updated and despawned by a simple system each frame.
+- `drift_effects` system spawns particles from both rear wheels whenever
+  Space is held and the car is moving above a small speed threshold:
+  - Tire smoke: grey spheres that drift up/outward and grow as they fade.
+  - Sparks: rarer (35% chance per spawn tick), brighter (emissive orange
+    material), faster, shorter-lived, affected by simulated gravity.
+
+
+4. CAMERA
+---------
+- Started as a simple fixed chase camera behind the car.
+- Iterated per feedback into an over-the-shoulder chase cam (closer,
+  lower, looking slightly ahead of the car into turns).
+- Flipped 180 degrees on request: camera now sits in FRONT of the car,
+  looking back at it, rather than chasing from behind.
+
+
+5. TRACK + RAMPS
+-----------------
+- Built a procedural stadium-oval track: two straights joined by two
+  180-degree turns, generated from a parameterized centerline function
+  (`track_centerline`) and built into road + barrier-wall meshes
+  (`spawn_track`). Barrier walls are real colliders (RigidBody::Static);
+  the road surface itself is purely visual (no collider of its own -- the
+  car actually rests on one big flat ground collider covering the whole
+  world).
+- Jump ramps: initially implemented as a real collider wedge, which caused
+  two significant, hard-fought problems:
+  - The car couldn't drive onto the ramp at all -- a tilted box has a
+    flat vertical end-cap at its base, effectively a small wall right at
+    the entry. Fixed by rebuilding the ramp as a true wedge (triangular
+    prism, via a custom mesh + Collider::convex_hull) that tapers to a
+    zero-height knife edge at the entry.
+  - The car still slowed down a lot and looked bad climbing it, because
+    the car's rigid body has its pitch axis locked (can't tilt nose-up),
+    so its flat underside was plowing into the slope instead of rolling
+    up it.
+  - Both problems were ultimately solved by abandoning real colliders for
+    ramps entirely. Ramps are now purely visual meshes paired with a
+    `RampZone` component; a `ramp_zones` system checks (via plain position
+    math, no collision) whether the car's position is within a ramp's
+    rectangular footprint, and while it is, directly overrides the car's
+    Y position to follow the ramp's known slope, zeroing vertical velocity
+    so gravity doesn't fight it. This removed all drag/slowdown and the
+    clipping/jank look entirely.
+  - Jump ramps additionally fire a one-time upward velocity boost the
+    moment the car exits over the far edge (trading none of the preserved
+    horizontal speed), scaled down and capped (LAUNCH_BOOST_SCALE,
+    MAX_LAUNCH_SPEED) after an early version launched the car far too high
+    once top speed was increased later in the project.
+- Track was enlarged substantially ("way bigger track") and turn
+  smoothness was improved (ARC_STEPS increased) so the bigger turns don't
+  look faceted.
+- Track direction was reversed (car now starts at the opposite end,
+  facing the other way) per request.
+
+
+6. CAR LAUNCHING OFF THE MAP (debugging saga)
+-----------------------------------------------
+This was the single most involved debugging arc in the project. In order
+to make the car visually tilt up a ramp's slope, its pitch axis was
+temporarily unlocked on the physics body itself. This repeatedly caused
+the car to be flung off the map at extreme speed, for several different
+root causes found one at a time:
+  1. A self-leveling correction (meant to settle the car back to flat when
+     nothing else was acting on it) was an angular ACCELERATION being
+     added directly to angular velocity every frame without being scaled
+     by delta-time -- at a free-running framerate this snowballed into a
+     runaway spin within moments.
+  2. Even after fixing the above, a hard clamp on pitch (to stop it
+     exceeding ~34 degrees) was still not enough -- any collision at an
+     angle (e.g. clipping a barrier while drifting) could redirect engine
+     thrust in a bad direction and still launch the car.
+  3. The real fix: physically unlocking the car's pitch was abandoned
+     entirely. The rigid body's pitch (and roll) are locked again, exactly
+     as originally designed. In its place, a purely cosmetic
+     `car_visual_tilt` system rotates only the *visual* glTF child model
+     (never the physics body) based on current climb/fall rate, computed
+     from the ratio of vertical to horizontal velocity. This can tilt the
+     model's appearance without ever being able to feed back into the
+     physics simulation, so it cannot cause this entire class of bug again.
+- A MaxAngularSpeed(6.0) safety cap remains on the car's rigid body as
+  cheap insurance against any future runaway-spin bug.
+
+
+7. TWO-LEVEL TRACK
+--------------------
+- Added a second, elevated oval track (identical shape to the ground
+  oval, generated by the same generalized `spawn_track`/`track_centerline`
+  functions, now parameterized by half_straight/turn_radius/track_width/
+  offset/barrier colors) raised up and shifted east so its footprint never
+  overlaps the ground oval's.
+- The elevated oval has blue/white barriers (vs. the ground oval's
+  red/white) so the two levels are visually distinguishable.
+- Added a real physical floor platform (RigidBody::Static collider +
+  matching visual slab) under the entire elevated oval's footprint --
+  without this there would be nothing for the car to actually rest on up
+  there, since (as noted in section 5) the road meshes themselves have no
+  collider.
+- Two long, gentle connector ramps (NOT jump ramps -- `RampZone.is_jump =
+  false`) link the two levels, one per straight, using the same
+  collision-free kinematic technique as the jump ramps but without the
+  launch-boost on exit, since a connector should smoothly become flat
+  ground on the far level rather than launching the car into the air.
+- Care was taken placing these connector ramps to avoid two geometry
+  conflicts discovered during design: (a) the main oval's own perimeter
+  barrier wraps all the way around with no gaps, so a ramp can't just
+  "exit" at the very end of a straight without colliding with the
+  turn's tail-end barrier stub; and (b) the car needs to have already
+  climbed well above barrier height (~0.6 units) by the time it reaches
+  that geometry. Both are handled by starting each connector ramp well
+  back from the turn (CONNECTOR_RAMP_START_X) and climbing gently over a
+  long run.
+
+
+8. VISUAL + LAYOUT CLEANUP PASS
+----------------------------------
+Per an explicit "clean this track up a lot" request, covering both visual
+polish and layout/structural issues:
+- Found and fixed the main source of a "messy" look: barrier stripe colors
+  were alternating by segment INDEX, not by distance. Since each straight
+  was a single giant segment (one solid color the whole way) while each
+  turn was subdivided into 48 small arc segments (rapid color flicker),
+  the stripe cadence was wildly inconsistent around the track. Fixed by
+  (a) subdividing the straights into ~STRIPE_LENGTH-sized chunks just like
+  the turns already were, and (b) picking each segment's barrier color by
+  cumulative distance along the loop rather than segment index, giving a
+  consistent rumble-strip cadence everywhere.
+- Added a white center lane line down the middle of every road segment
+  (ground oval, elevated oval, and both connector ramps).
+- Added visual + collider support pillars under the elevated platform so
+  it no longer looks like it's floating in nothing.
+- Added real guardrail colliders along both sides of each connector ramp
+  (tall vertical walls spanning the full climb height), fixing a
+  previously-flagged issue where drifting off the side mid-climb meant
+  falling straight through with no support at all.
+- Replaced the default near-black void background and harsh shadow-only
+  lighting with a proper sky-blue ClearColor and a soft GlobalAmbientLight
+  fill light.
+
+
+9. GAMEPLAY TUNING (iterative, by feel)
+------------------------------------------
+Top speed and acceleration were adjusted several times based on direct
+playtesting feedback ("make the car go faster", then several rounds of
+"a little slower"). Current values live in `Car::default()` in
+src/main.rs and are the easiest place to retune the car's feel.
+
+
+10. STANDALONE MAC APP
+-------------------------
+- Packaged the game as a real .app bundle at
+  ~/Applications/Drift Carts.app so it's launchable from Spotlight/Finder
+  like a normal Mac app, rather than only via `cargo run` in a terminal.
+- This went through a few iterations:
+  - First attempt wrapped the DEBUG build (dynamic_linking feature) in a
+    shell-script launcher that set DYLD_LIBRARY_PATH and BEVY_ASSET_ROOT.
+    This worked when run directly from a terminal, but crashed (SIGABRT)
+    when launched via Finder/Spotlight, because macOS's file-system
+    sandbox blocked it from loading its own dylib files out of
+    ~/Desktop/... for an app not launched from a trusted shell context.
+  - This was initially misdiagnosed as a folder-access permission dialog
+    (the user had clicked "don't allow" on an unrelated Desktop-folder
+    permission prompt around the same time) -- `tccutil reset` was tried
+    first and did not fix it, since the real problem was the dylib load
+    sandbox block, not a revocable permission.
+  - The real, permanent fix: build a `cargo build --release` binary
+    instead of the dev/dynamic_linking one. A release build is fully
+    statically linked with no separate dylib files to load at all. The
+    binary and all its assets were also moved out of ~/Desktop entirely,
+    into the .app bundle itself under ~/Applications (not a macOS
+    "protected" folder), removing the sandboxed-folder problem entirely
+    as well.
+  - The app bundle's launcher is a small shell script
+    (Contents/MacOS/DriftCarts) that sets BEVY_ASSET_ROOT to the bundle's
+    own Contents/Resources directory (where the assets/ folder was
+    copied) and execs the real compiled binary
+    (Contents/MacOS/drift_carts_bin).
+- IMPORTANT ONGOING NOTE: this app bundle does NOT auto-update. After any
+  future code change, the release binary must be rebuilt
+  (`cargo build --release`) and re-copied into
+  "~/Applications/Drift Carts.app/Contents/MacOS/drift_carts_bin"
+  for the Spotlight-launchable app to reflect the change.
+
+
+11. KNOWN OPEN ISSUE: falling through the floor
+----------------------------------------------------
+The user reported still falling through the floor, plus a report that a
+jump ramp "on the left side" appeared to be facing the wrong way. An
+initial attempted fix (adding `SweptCcd` continuous-collision-detection to
+the car, plus a `catch_falling_car` safety-net system that would respawn
+the car if its Y ever dropped far below any real floor) was written,
+built, and deployed to the app bundle, but was then explicitly reverted
+at the user's request before the underlying cause was confirmed. The
+suspected but NOT YET CONFIRMED root cause, identified while investigating
+but not yet acted on: the south-straight connector ramp's kinematic zone
+(RampZone with is_jump=false, spanning world x in
+[CONNECTOR_RAMP_START_X, CONNECTOR_RAMP_START_X + CONNECTOR_RAMP_LENGTH]
+= [10, 80] at the time of writing) overlaps the car's own spawn position
+(x = HALF_STRAIGHT = 30, on the same straight), meaning the car currently
+spawns already partway inside that ramp's zone. This is a real,
+verified-by-math placement bug, separate from (and possibly contributing
+to, but not fully confirmed as the sole cause of) the floor-falling
+report. This remains open and should be the starting point for the next
+session.
+
+
+FILE MAP
+--------
+- src/main.rs       -- the entire game (one file: setup, car controller,
+                       physics, track generation, ramps, particles, camera).
+- assets/models/    -- Kenney Car Kit glTF models + shared texture
+                       (race.glb used; sedan.glb downloaded but unused).
+- Cargo.toml        -- bevy 0.19, avian3d 0.7.0, rand 0.10 dependencies;
+                       a `dev` feature for fast dynamic-linked debug builds.
+- docs/progress.txt -- this file.
+
+
+BUILD / RUN
+-----------
+  export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+  cargo run --features dev      # fast iterative debug build
+  cargo build --release         # what the standalone .app bundle runs
+
+After any change meant to reach the Spotlight-launchable app, rebuild
+release and copy the binary into the bundle:
+  cp target/release/drift_carts \
+    "/Users/brockbarre/Applications/Drift Carts.app/Contents/MacOS/drift_carts_bin"
