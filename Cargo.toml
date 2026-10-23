@@ -1,0 +1,21 @@
+[package]
+name = "drift_carts"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+avian3d = "0.7.0"
+bevy = "0.19"
+rand = "0.10.3"
+
+[features]
+# cargo run --features dev  -> much faster incremental builds while iterating
+dev = ["bevy/dynamic_linking"]
+
+# Bevy's own crates are slow to compile at debug opt-level; keep them optimized
+# even in dev builds so framerate stays sane during iteration.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
