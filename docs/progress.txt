@@ -240,7 +240,7 @@ src/main.rs and are the easiest place to retune the car's feel.
   for the Spotlight-launchable app to reflect the change.
 
 
-11. KNOWN OPEN ISSUE: falling through the floor
+11. FALLING THROUGH THE FLOOR -- RESOLVED
 ----------------------------------------------------
 The user reported still falling through the floor, plus a report that a
 jump ramp "on the left side" appeared to be facing the wrong way. An
@@ -248,18 +248,77 @@ initial attempted fix (adding `SweptCcd` continuous-collision-detection to
 the car, plus a `catch_falling_car` safety-net system that would respawn
 the car if its Y ever dropped far below any real floor) was written,
 built, and deployed to the app bundle, but was then explicitly reverted
-at the user's request before the underlying cause was confirmed. The
-suspected but NOT YET CONFIRMED root cause, identified while investigating
-but not yet acted on: the south-straight connector ramp's kinematic zone
-(RampZone with is_jump=false, spanning world x in
-[CONNECTOR_RAMP_START_X, CONNECTOR_RAMP_START_X + CONNECTOR_RAMP_LENGTH]
-= [10, 80] at the time of writing) overlaps the car's own spawn position
-(x = HALF_STRAIGHT = 30, on the same straight), meaning the car currently
-spawns already partway inside that ramp's zone. This is a real,
-verified-by-math placement bug, separate from (and possibly contributing
-to, but not fully confirmed as the sole cause of) the floor-falling
-report. This remains open and should be the starting point for the next
-session.
+at the user's request before the underlying cause was confirmed.
+
+The actual root cause was found later (see section 12) once the user could
+report an exact world-X coordinate where it happened: the elevated oval's
+physical floor collider was sized using
+`elevated_floor_half_x = HALF_STRAIGHT + TURN_RADIUS` -- the track's
+CENTERLINE extent -- but the real drivable road (and its outer barrier)
+sticks out another TRACK_WIDTH/2 past that at a turn's apex. The Z
+half-extent already correctly included that `+ TRACK_WIDTH / 2.0` padding;
+the X half-extent did not. Near the elevated oval's east turn apex (around
+world x=160-168), the floor's edge fell short of where the real outer
+barrier actually was, so driving the outside line through that turn drove
+the car off the edge of the solid floor into open air, 8 units above the
+ground level -- which reads exactly like "falling through the floor."
+Fixed by adding the same `+ TRACK_WIDTH / 2.0` padding to
+`elevated_floor_half_x` that `elevated_floor_half_z` already had.
+
+
+12. DEBUG COORDINATE GRID ("line debug system")
+---------------------------------------------------
+Added specifically to make bugs like the one in section 11 reportable by
+exact coordinate instead of by vague description, and it worked -- the
+user's report of "falling through the floor near line 160" is what let
+the actual bug get found and fixed in one pass.
+
+- A `DebugMode` resource, toggled by either the backquote (`) key or a
+  clickable on-screen "DEBUG" button (top-left corner, built with Bevy's
+  classic `Button`/`Interaction` UI widgets, not the newer observer-based
+  ones) -- both paths share one `toggle_debug_mode` system, so they can
+  never drift out of sync. The button also recolors itself (dark/green)
+  to show current state.
+- A `DebugEntity` marker component tags every grid line, every digit
+  segment, and nothing else, so toggling is a single query over one
+  component regardless of how many entities make up the grid.
+- The grid itself: a bright magenta line is spawned every
+  DEBUG_MARKER_SPACING (10) world-X units from DEBUG_MARKER_X_MIN to
+  DEBUG_MARKER_X_MAX, spanning the full Z-width of the map
+  (DEBUG_MARKER_Z_HALF_EXTENT) -- and the whole thing is spawned TWICE,
+  once at ground height and once at the elevated level's height, so the
+  grid reads correctly on either level.
+- The number labels went through several iterations before landing on
+  their current form, each a direct response to user feedback:
+    - First built as screen-space Bevy UI `Text` nodes, continuously
+      re-projected from their world position via `Camera::world_to_viewport`
+      every frame (`update_debug_labels`). Worked, but the user wanted
+      the numbers to be actual markings "on the track," not a floating
+      HUD overlay.
+    - Replaced entirely with real seven-segment digit meshes
+      (`digit_segments`/`spawn_debug_number`) built from thin flat boxes,
+      the same visual style as the grid lines and the existing lane
+      center-line -- true world geometry, no per-frame projection system
+      needed anymore (update_debug_labels and the DebugLabel component
+      were deleted).
+    - The numbers initially sat directly on top of their own line and
+      were hard to read against it. First attempt offset them along Z --
+      which doesn't actually work, since the line itself runs lengthwise
+      along Z and spans the entire map, so sliding along Z just moves to
+      a different point still on the same line. Fixed by offsetting along
+      X instead (the direction actually perpendicular to the line's own
+      length).
+    - The digits initially rendered upside down ("facing downwards");
+      fixed by mirroring each segment's position vertically
+      (`mirrored_z = DIGIT_HEIGHT - local_z`).
+    - Numbers were originally placed once per marker at z=0 (the map's
+      center) -- but the track's straights actually run along z=+-22
+      (TURN_RADIUS), not through the middle of the map, so most numbers
+      ended up stranded in the empty infield, off the actual track, where
+      the user couldn't see them while driving. Fixed by spawning two
+      copies of each number, one next to each straight
+      (z = +-TURN_RADIUS), so one is always near whichever lane the
+      player is actually on.
 
 
 FILE MAP

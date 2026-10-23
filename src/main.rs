@@ -33,10 +33,27 @@ const CONNECTOR_RAMP_START_X: f32 = 10.0;
 /// oval's own straight start, so the ramp hands off flush with no seam.
 const CONNECTOR_RAMP_LENGTH: f32 = ELEVATED_OFFSET_X - HALF_STRAIGHT - CONNECTOR_RAMP_START_X;
 
+/// Debug grid: a numbered world-X marker line every DEBUG_MARKER_SPACING
+/// units, spanning the full width (Z) of the map. Useful for reading off
+/// exact world X coordinates while driving -- e.g. to check a ramp zone's
+/// boundaries against where it actually sits on the ground.
+const DEBUG_MARKER_SPACING: f32 = 10.0;
+const DEBUG_MARKER_X_MIN: f32 = -60.0;
+const DEBUG_MARKER_X_MAX: f32 = 200.0;
+const DEBUG_MARKER_Z_HALF_EXTENT: f32 = 200.0;
+
+/// Size of one seven-segment digit painted flat on the ground next to each
+/// debug marker line (see `digit_segments`/`spawn_debug_number`).
+const DIGIT_WIDTH: f32 = 0.6;
+const DIGIT_HEIGHT: f32 = 1.2;
+const DIGIT_SPACING: f32 = 0.2;
+const DIGIT_SEGMENT_THICKNESS: f32 = 0.15;
+
 fn main() {
     App::new()
         .add_plugins((DefaultPlugins, PhysicsPlugins::default()))
         .add_systems(Startup, setup)
+        .init_resource::<DebugMode>()
         .add_systems(
             Update,
             (
@@ -45,12 +62,28 @@ fn main() {
                 car_visual_tilt,
                 drift_effects,
                 update_particles,
+                toggle_debug_mode,
                 camera_follow,
             )
                 .chain(),
         )
         .run();
 }
+
+/// Whether the debug coordinate-grid overlay (backquote key) is showing.
+#[derive(Resource, Default)]
+struct DebugMode(bool);
+
+/// Tags every entity that belongs to the debug overlay (both the ground
+/// grid lines and the number labels), so `toggle_debug_mode` can flip all
+/// of their visibility at once with a single query.
+#[derive(Component)]
+struct DebugEntity;
+
+/// The on-screen clickable button that toggles debug mode (an alternative
+/// to the backquote key, for anyone who'd rather click than remember a key).
+#[derive(Component)]
+struct DebugToggleButton;
 
 /// Tunable arcade handling constants for a drivable car.
 #[derive(Component)]
@@ -166,7 +199,14 @@ fn setup(
     // footprint (road, turns, and infield alike) -- the road mesh itself has
     // no collider of its own (same as ground level), so without this the car
     // would have nothing to actually rest on once it reaches the second level.
-    let elevated_floor_half_x = HALF_STRAIGHT + TURN_RADIUS;
+    //
+    // Both half-extents need the + TRACK_WIDTH/2.0 padding: the track's
+    // CENTERLINE spans only HALF_STRAIGHT+TURN_RADIUS, but the actual road
+    // (and its outer barrier) sticks out another TRACK_WIDTH/2 past that at
+    // a turn's apex -- missing this on the X side left the floor's edge
+    // short of the real outer barrier near a turn, so driving the outside
+    // line there drove off the edge of the solid floor into open air.
+    let elevated_floor_half_x = HALF_STRAIGHT + TURN_RADIUS + TRACK_WIDTH / 2.0;
     let elevated_floor_half_z = TURN_RADIUS + TRACK_WIDTH / 2.0;
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(
@@ -349,6 +389,158 @@ fn setup(
         Camera3d::default(),
         Transform::from_xyz(0.0, 2.2, -4.0).looking_at(Vec3::new(0.0, 0.8, 0.0), Vec3::Y),
     ));
+
+    // Debug coordinate grid (hidden by default; toggled with the ` key by
+    // toggle_debug_mode). One bright line + one number label per world-X
+    // marker, spanning the full width of the map -- spawned once at ground
+    // height and again at the elevated level's height, so the grid reads
+    // correctly no matter which level you're currently driving on.
+    let debug_line_mesh = meshes.add(Cuboid::new(0.3, 0.05, DEBUG_MARKER_Z_HALF_EXTENT * 2.0));
+    let debug_line_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.1, 1.0),
+        emissive: LinearRgba::rgb(1.5, 0.1, 1.5),
+        unlit: true,
+        ..default()
+    });
+    // Digit segment meshes, shared by every number painted on the ground --
+    // every segment of every digit is one of just these two box shapes.
+    let digit_h_mesh = meshes.add(Cuboid::new(DIGIT_WIDTH, 0.03, DIGIT_SEGMENT_THICKNESS));
+    let digit_v_mesh = meshes.add(Cuboid::new(
+        DIGIT_SEGMENT_THICKNESS,
+        0.03,
+        DIGIT_HEIGHT / 2.0,
+    ));
+
+    for level_y in [0.0, ELEVATED_HEIGHT] {
+        let mut marker_x = DEBUG_MARKER_X_MIN;
+        while marker_x <= DEBUG_MARKER_X_MAX {
+            commands.spawn((
+                DebugEntity,
+                Visibility::Hidden,
+                Mesh3d(debug_line_mesh.clone()),
+                MeshMaterial3d(debug_line_material.clone()),
+                Transform::from_xyz(marker_x, level_y + 0.12, 0.0),
+            ));
+            // Offset perpendicular to the line -- the line runs lengthwise
+            // along Z (spanning the whole map), so moving along Z just slides
+            // along the same line; X is the direction that actually steps off
+            // of it.
+            const DEBUG_NUMBER_X_OFFSET: f32 = 1.5;
+            // One copy of the number on each straight (z = +/-TURN_RADIUS)
+            // instead of a single copy at z=0 -- the track's straights sit
+            // out at +/-TURN_RADIUS, not through the middle of the map, so a
+            // single centered copy was stranded in the empty infield for
+            // every marker that falls within a straight's X range.
+            for track_z in [-TURN_RADIUS, TURN_RADIUS] {
+                spawn_debug_number(
+                    &mut commands,
+                    &digit_h_mesh,
+                    &digit_v_mesh,
+                    &debug_line_material,
+                    &format!("{marker_x:.0}"),
+                    Vec3::new(marker_x + DEBUG_NUMBER_X_OFFSET, level_y + 0.19, track_z),
+                );
+            }
+            marker_x += DEBUG_MARKER_SPACING;
+        }
+    }
+
+    // On-screen clickable button that does the same thing as pressing `.
+    commands
+        .spawn((
+            DebugToggleButton,
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(10.0),
+                top: Val::Px(10.0),
+                width: Val::Px(120.0),
+                height: Val::Px(40.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.15, 0.15, 0.18)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("DEBUG"),
+                TextFont {
+                    font_size: 16.0.into(),
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+            ));
+        });
+}
+
+/// Returns the center (local x, z) and orientation (true = horizontal bar,
+/// false = vertical bar) of each lit segment for one character, using a
+/// classic seven-segment layout. Local space: x right, z up, origin at the
+/// character's bottom-left corner, sized DIGIT_WIDTH x DIGIT_HEIGHT.
+fn digit_segments(c: char) -> &'static [(f32, f32, bool)] {
+    const W: f32 = DIGIT_WIDTH;
+    const H: f32 = DIGIT_HEIGHT;
+    const TOP: (f32, f32, bool) = (W / 2.0, H, true);
+    const MIDDLE: (f32, f32, bool) = (W / 2.0, H / 2.0, true);
+    const BOTTOM: (f32, f32, bool) = (W / 2.0, 0.0, true);
+    const TOP_LEFT: (f32, f32, bool) = (0.0, H * 0.75, false);
+    const TOP_RIGHT: (f32, f32, bool) = (W, H * 0.75, false);
+    const BOTTOM_LEFT: (f32, f32, bool) = (0.0, H * 0.25, false);
+    const BOTTOM_RIGHT: (f32, f32, bool) = (W, H * 0.25, false);
+
+    match c {
+        '0' => &[TOP, TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT, BOTTOM],
+        '1' => &[TOP_RIGHT, BOTTOM_RIGHT],
+        '2' => &[TOP, TOP_RIGHT, MIDDLE, BOTTOM_LEFT, BOTTOM],
+        '3' => &[TOP, TOP_RIGHT, MIDDLE, BOTTOM_RIGHT, BOTTOM],
+        '4' => &[TOP_LEFT, TOP_RIGHT, MIDDLE, BOTTOM_RIGHT],
+        '5' => &[TOP, TOP_LEFT, MIDDLE, BOTTOM_RIGHT, BOTTOM],
+        '6' => &[TOP, TOP_LEFT, MIDDLE, BOTTOM_LEFT, BOTTOM_RIGHT, BOTTOM],
+        '7' => &[TOP, TOP_RIGHT, BOTTOM_RIGHT],
+        '8' => &[TOP, TOP_LEFT, TOP_RIGHT, MIDDLE, BOTTOM_LEFT, BOTTOM_RIGHT, BOTTOM],
+        '9' => &[TOP, TOP_LEFT, TOP_RIGHT, MIDDLE, BOTTOM_RIGHT],
+        '-' => &[MIDDLE],
+        _ => &[],
+    }
+}
+
+/// Paints a number flat on the ground out of seven-segment-digit meshes
+/// (see `digit_segments`), centered horizontally and vertically on `center`.
+/// All spawned entities are tagged `DebugEntity` and start hidden, exactly
+/// like the grid lines, so `toggle_debug_mode` shows/hides them together.
+fn spawn_debug_number(
+    commands: &mut Commands,
+    h_mesh: &Handle<Mesh>,
+    v_mesh: &Handle<Mesh>,
+    material: &Handle<StandardMaterial>,
+    text: &str,
+    center: Vec3,
+) {
+    let char_count = text.chars().count() as f32;
+    let total_width = char_count * DIGIT_WIDTH + (char_count - 1.0).max(0.0) * DIGIT_SPACING;
+    let start_x = center.x - total_width / 2.0;
+
+    for (i, c) in text.chars().enumerate() {
+        let digit_origin = Vec3::new(
+            start_x + i as f32 * (DIGIT_WIDTH + DIGIT_SPACING),
+            center.y,
+            center.z - DIGIT_HEIGHT / 2.0,
+        );
+        for &(local_x, local_z, horizontal) in digit_segments(c) {
+            let mesh = if horizontal { h_mesh.clone() } else { v_mesh.clone() };
+            // Mirrored vertically (top<->bottom) -- without this the digits
+            // read upside down from the usual driving/viewing angle.
+            let mirrored_z = DIGIT_HEIGHT - local_z;
+            commands.spawn((
+                DebugEntity,
+                Visibility::Hidden,
+                Mesh3d(mesh),
+                MeshMaterial3d(material.clone()),
+                Transform::from_translation(digit_origin + Vec3::new(local_x, 0.0, mirrored_z)),
+            ));
+        }
+    }
 }
 
 /// Centerline of an oval of the given dimensions, in traversal order, relative
@@ -924,4 +1116,43 @@ fn camera_follow(
 
     let look_target = car_transform.translation + back * 2.0 + Vec3::Y * 0.6;
     camera_transform.look_at(look_target, Vec3::Y);
+}
+
+/// Backquote (`) OR clicking the on-screen DEBUG button flips the debug
+/// coordinate-grid overlay on/off, showing or hiding every grid line and
+/// number label in one go.
+fn toggle_debug_mode(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut debug_mode: ResMut<DebugMode>,
+    mut entity_query: Query<&mut Visibility, With<DebugEntity>>,
+    button_query: Query<&Interaction, (Changed<Interaction>, With<DebugToggleButton>)>,
+    mut button_color_query: Query<&mut BackgroundColor, With<DebugToggleButton>>,
+) {
+    let key_pressed = keys.just_pressed(KeyCode::Backquote);
+    let button_clicked = button_query
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed);
+
+    if !key_pressed && !button_clicked {
+        return;
+    }
+
+    debug_mode.0 = !debug_mode.0;
+    let visibility = if debug_mode.0 {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut vis in &mut entity_query {
+        *vis = visibility;
+    }
+
+    // Highlight the button itself while debug mode is active.
+    if let Ok(mut color) = button_color_query.single_mut() {
+        color.0 = if debug_mode.0 {
+            Color::srgb(0.2, 0.7, 0.3)
+        } else {
+            Color::srgb(0.15, 0.15, 0.18)
+        };
+    }
 }
